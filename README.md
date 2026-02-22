@@ -1,6 +1,6 @@
 # Docker Debug Container
 
-A Docker container designed to simulate common failure scenarios in ECS/EKS environments for debugging and testing purposes.
+A Docker container designed to simulate common failure scenarios in AWS ECS environments for debugging and testing purposes.
 
 ## Available Endpoints
 
@@ -8,15 +8,15 @@ A Docker container designed to simulate common failure scenarios in ECS/EKS envi
 Returns a list of all available endpoints and their descriptions.
 
 ### `GET /status`
-**Purpose**: Redirects to a configured error scenario endpoint
-**Response**: 302 redirect to the endpoint specified by `STATUS_ENDPOINT` environment variable
+**Purpose**: Forwards internally to a configured error scenario endpoint
+**Response**: Returns the response from the endpoint specified by `STATUS_ENDPOINT` environment variable
 **Use Case**: Health check endpoint that can be configured to simulate different scenarios
-**Default**: Redirects to `/healthy` if `STATUS_ENDPOINT` is not set
+**Default**: Forwards to `/healthy` if `STATUS_ENDPOINT` is not set
 
 ```bash
 # Set the status endpoint via environment variable
 docker run -p 8080:8080 -e STATUS_ENDPOINT=/unhealthy -e THIS_IS_IMPORTANT=value docker-debug:latest
-curl http://localhost:8080/status  # Will redirect to /unhealthy
+curl http://localhost:8080/status  # Will return 500 from /unhealthy
 ```
 
 ### `GET /healthy`
@@ -37,14 +37,6 @@ curl http://localhost:8080/healthy
 curl http://localhost:8080/unhealthy
 ```
 
-### `GET /slow-start`
-**Purpose**: Simulates slow application startup
-**Response**: 200 OK after 60 seconds
-**Use Case**: Test health check initial delay settings and startup probes
-
-```bash
-curl http://localhost:8080/slow-start
-```
 
 ### `GET /memory-leak`
 **Purpose**: Allocates ~100MB of memory on each call
@@ -81,15 +73,30 @@ docker run -p 8080:8080 -m 512m -e THIS_IS_IMPORTANT=value docker-debug:latest
 docker run -p 3000:3000 -e PORT=3000 -e THIS_IS_IMPORTANT=value docker-debug:latest
 ```
 
+## Environment Variables
+
+- **`THIS_IS_IMPORTANT`** (required): Must be set or the container will fail to start with a KeyError
+- **`STATUS_ENDPOINT`** (optional): Specifies which endpoint `/status` should forward to (default: `/healthy`)
+  - Valid values: `/healthy`, `/unhealthy`, `/memory-leak`
+- **`SLOW_START_DELAY`** (optional): Delay in seconds before the app starts accepting requests (default: 0)
+  - Used to simulate slow-starting containers
+- **`PORT`** (optional): Port the app listens on (default: 8080)
+
 ## Testing Scenarios
 
 ### Test Health Check Failure
-Configure your ECS/EKS health check to use `/healthy`, then switch to `/unhealthy` to trigger failures.
+Configure your ECS health check to use `/healthy`, then switch to `/unhealthy` to trigger failures.
 
 ### Test Slow Startup
-1. Set health check path to `/slow-start`
-2. Configure initial delay shorter than 60s
-3. Watch the container fail health checks and restart
+The slow startup scenario uses the `SLOW_START_DELAY` environment variable to delay the container's startup by 60 seconds. During this time, the container won't respond to health checks.
+
+```bash
+# Run locally with slow startup
+docker run -p 8080:8080 -e SLOW_START_DELAY=60 -e THIS_IS_IMPORTANT=value docker-debug:latest
+
+# Container will take 60 seconds before it starts accepting requests
+# Health checks will fail during this period
+```
 
 ### Test Memory Limits
 1. Run container with memory limit: `docker run -p 8080:8080 -m 256m docker-debug:latest`
@@ -128,8 +135,8 @@ The CloudFormation template (`ecs-docker-debug.yaml`) includes a parameter `pErr
 2. **unhealthy**: `/status` → `/unhealthy`, `THIS_IS_IMPORTANT` is set
    - Health checks fail with 500 errors, causing container restarts
 
-3. **slow-start**: `/status` → `/slow-start`, `THIS_IS_IMPORTANT` is set
-   - Health checks take 60 seconds to respond, testing startup probe settings
+3. **slow-start**: `/status` → `/healthy`, `SLOW_START_DELAY` = 60, `THIS_IS_IMPORTANT` is set
+   - Container startup is delayed by 60 seconds, testing startup probe and grace period settings
 
 4. **memory-leak**: `/status` → `/memory-leak`, `THIS_IS_IMPORTANT` is set
    - Each health check allocates 100MB, eventually triggering OOMKilled
@@ -163,114 +170,80 @@ aws cloudformation create-stack \
     ParameterKey=pErrorScenario,ParameterValue=missing-env-var
 ```
 
-### ECS Service with Circuit Breaker (Prevents Infinite Restarts)
+### Health Check Configuration
 
-When running as an ECS Service (not a standalone Task), you can use the **Deployment Circuit Breaker** to prevent endless restart loops. After N failed attempts, ECS will stop trying to deploy and optionally roll back.
+When configuring ECS health checks for this container, consider these parameters:
 
-**Key Settings:**
-- `deploymentCircuitBreaker.enable: true` - Stops deployment after repeated failures
-- `deploymentCircuitBreaker.rollback: true` - Automatically reverts to last working version
-- `healthCheckGracePeriodSeconds: 60` - Time before load balancer health checks start counting
-
-See `ecs-task-definition.json` and `ecs-service-definition.json` for complete examples.
-
-### Creating the Service
-
-```bash
-# Register task definition
-aws ecs register-task-definition --cli-input-json file://ecs-task-definition.json
-
-# Create service with circuit breaker
-aws ecs create-service --cli-input-json file://ecs-service-definition.json
-```
-
-### Testing Circuit Breaker Behavior
-
-**Scenario 1: Unhealthy Container**
-```bash
-# Change health check to point to /unhealthy endpoint in task definition
-# Deploy the service - circuit breaker will trigger after ~10 minutes of failures
-# Service will stop attempting deployment and rollback if enabled
-```
-
-**Scenario 2: Slow Startup Timeout**
-```bash
-# Set health check path to /slow-start (takes 60s)
-# Set startPeriod to 30s (shorter than response time)
-# Circuit breaker will detect pattern and stop deployment
-```
-
-### ECS Task Definition (Full Example)
-
-See `ecs-task-definition.json` for the complete configuration including:
-- Health check with proper `startPeriod` for slow starts
-- CloudWatch Logs configuration
-- Memory and CPU allocation
-- Fargate compatibility
-
-### Health Check Parameters Explained
-
-```json
-"healthCheck": {
-  "command": ["CMD-SHELL", "curl -f http://localhost:8080/healthy || exit 1"],
-  "interval": 30,        // Check every 30 seconds
-  "timeout": 5,          // Fail if check takes > 5 seconds
-  "retries": 3,          // Mark unhealthy after 3 consecutive failures
-  "startPeriod": 60      // Grace period for slow startup (failures don't count)
-}
-```
+**Health Check Parameters:**
+- `interval`: How often to check (e.g., 30 seconds)
+- `timeout`: Maximum time for check to respond (e.g., 5 seconds)
+- `retries`: Consecutive failures before marking unhealthy (e.g., 3)
+- `startPeriod`: Grace period for slow startup where failures don't count (e.g., 60 seconds)
 
 **For this debug container:**
-- Use `startPeriod: 60` or higher when testing `/slow-start` endpoint
+- Use `startPeriod: 60` or higher when testing the `slow-start` scenario (with `SLOW_START_DELAY=60`)
 - Use `startPeriod: 10` when testing normal `/healthy` endpoint
 - Set `retries: 3` to see container restart after 3 failed checks
 
-### Without Circuit Breaker (Default Behavior)
+### CloudWatch Alarms
 
-If you don't enable the circuit breaker, ECS will continuously try to restart failed tasks indefinitely. This is useful for transient failures but problematic for persistent issues like misconfiguration.
+The CloudFormation template automatically creates three CloudWatch alarms to monitor the health of your ECS service:
 
-## Kubernetes Deployment Example
+#### 1. Service Restart Alarm (`{StackName}-service-restarts`)
+**Purpose**: Detects when the ECS service is experiencing repeated task restarts
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: debug-container
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: debug
-  template:
-    metadata:
-      labels:
-        app: debug
-    spec:
-      containers:
-      - name: debug-app
-        image: docker-debug:latest
-        ports:
-        - containerPort: 8080
-        env:
-        - name: THIS_IS_IMPORTANT
-          value: "configured"
-        resources:
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-        livenessProbe:
-          httpGet:
-            path: /healthy
-            port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /healthy
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 5
-```
+**Triggers when:**
+- Running task count falls below desired count at least 2 times within a 5-minute period
+- Indicates the container is crashing and restarting repeatedly
+
+**Use cases:**
+- Detects the `unhealthy` scenario (container fails health checks)
+- Detects the `missing-env-var` scenario (container crashes on startup)
+- Catches any configuration issues causing container instability
+
+**Configuration:**
+- Metric: `RunningTaskCount` (ECS/ContainerInsights)
+- Evaluation: 5 periods of 1 minute each
+- Threshold: < 1 running task
+- Datapoints to alarm: 2 out of 5
+
+#### 2. Zero Running Tasks Alarm (`{StackName}-zero-running-tasks`)
+**Purpose**: Alerts when the service has no running tasks at all
+
+**Triggers when:**
+- No tasks are running for 1 minute
+- More critical than the restart alarm - indicates complete service outage
+
+**Use cases:**
+- Service cannot start any tasks successfully
+- All tasks have crashed
+- Deployment circuit breaker has stopped the service
+
+**Configuration:**
+- Metric: `RunningTaskCount` (ECS/ContainerInsights)
+- Evaluation: 1 period of 1 minute
+- Threshold: < 1 running task
+- Missing data: Treated as breaching (alarm state)
+
+#### 3. Zero Healthy Targets Alarm (`{StackName}-zero-healthy-targets`)
+**Purpose**: Alerts when the ALB has no healthy targets
+
+**Triggers when:**
+- No containers are passing the ALB health checks for 1 minute
+- Tasks may be running but failing health checks
+
+**Use cases:**
+- Containers are running but unhealthy (like the `unhealthy` scenario)
+- Health check endpoint is unreachable
+- Containers take too long to start (like the `slow-start` scenario with insufficient grace period)
+
+**Configuration:**
+- Metric: `HealthyHostCount` (AWS/ApplicationELB)
+- Evaluation: 1 period of 1 minute
+- Threshold: < 1 healthy target
+- Missing data: Treated as breaching (alarm state)
+
+**Note**: All three alarms are automatically created when you deploy the CloudFormation stack. They help you quickly identify which type of failure is occurring in your debug scenarios.
 
 ## Logs
 
