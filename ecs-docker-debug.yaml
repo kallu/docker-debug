@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS Fargate stack with ALB running a configurable Docker image for debugging. ALB in public subnets, containers in private subnets.
+
+Parameters:
+  pDockerImage:
+    Type: String
+    Description: Docker image to run (e.g., user/image:tag). Leave empty to deploy only infrastructure without ECS service/task.
+    Default: 'petrikallberg/docker-debug:latest'
+
+  pVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where resources will be deployed.
+
+  pPublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnet IDs for the Application Load Balancer (must be in at least 2 AZs).
+
+  pPrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs where ECS tasks will run (must have NAT gateway for internet access).
+
+  pContainerPort:
+    Type: Number
+    Description: Port the container listens on.
+    Default: 8080
+    MinValue: 1
+    MaxValue: 65535
+
+  pErrorScenario:
+    Type: String
+    Description: Error scenario to simulate for debugging
+    Default: healthy
+    AllowedValues:
+      - healthy
+      - unhealthy
+      - slow-start
+      - memory-leak
+      - missing-env-var
+    ConstraintDescription: Must be one of healthy, unhealthy, slow-start, memory-leak, or missing-env-var
+
+Conditions:
+  HasDockerImage: !Not [!Equals [!Ref pDockerImage, '']]
+  IsHealthyScenario: !Equals [!Ref pErrorScenario, 'healthy']
+  IsUnhealthyScenario: !Equals [!Ref pErrorScenario, 'unhealthy']
+  IsSlowStartScenario: !Equals [!Ref pErrorScenario, 'slow-start']
+  IsMemoryLeakScenario: !Equals [!Ref pErrorScenario, 'memory-leak']
+  IsMissingEnvVarScenario: !Equals [!Ref pErrorScenario, 'missing-env-var']
+  ShouldSetImportantVar: !Not [!Condition IsMissingEnvVarScenario]
+
+Rules:
+  PublicSubnetsInVpc:
+    Assertions:
+      - Assert:
+          Fn::EachMemberIn:
+            - Fn::ValueOfAll:
+                - AWS::EC2::Subnet::Id
+                - VpcId
+            - Fn::RefAll: AWS::EC2::VPC::Id
+        AssertDescription: All selected subnets must belong to the selected VPC.
+
+Resources:
+  # ============================================================================
+  # ALB Resources (always deployed)
+  # ============================================================================
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref pVpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from internet
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref pPublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: !Ref pContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref pVpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /status
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200-499
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tg'
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasDockerImage
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+          - Type: fixed-response
+            FixedResponseConfig:
+              StatusCode: '200'
+              ContentType: text/plain
+              MessageBody: OK
+
+  # ============================================================================
+  # ECS Resources (always deployed)
+  # ============================================================================
+
+  EcsTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS Fargate tasks
+      VpcId: !Ref pVpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref pContainerPort
+          ToPort: !Ref pContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: Allow traffic from ALB
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ecs-tasks-sg'
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cluster'
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-TaskExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-execution-role'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-docker-debug'
+      RetentionInDays: 7
+
+  # ============================================================================
+  # ECS Task and Service (conditional - only deployed if Docker image provided)
+  # ============================================================================
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasDockerImage
+    Properties:
+      Family: !Sub '${AWS::StackName}-docker-debug'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: docker-debug
+          Image: !Ref pDockerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref pContainerPort
+              Protocol: tcp
+          Environment:
+            - !If
+              - ShouldSetImportantVar
+              - Name: THIS_IS_IMPORTANT
+                Value: configured
+              - !Ref AWS::NoValue
+            - Name: STATUS_ENDPOINT
+              Value: !If
+                - IsHealthyScenario
+                - /healthy
+                - !If
+                  - IsUnhealthyScenario
+                  - /unhealthy
+                  - !If
+                    - IsSlowStartScenario
+                    - /slow-start
+                    - !If
+                      - IsMemoryLeakScenario
+                      - /memory-leak
+                      - /healthy
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  EcsService:
+    Type: AWS::ECS::Service
+    Condition: HasDockerImage
+    DependsOn: AlbListener
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-docker-debug'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref pPrivateSubnetIds
+          SecurityGroups:
+            - !Ref EcsTaskSecurityGroup
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: docker-debug
+          ContainerPort: !Ref pContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+  # ============================================================================
+  # CloudWatch Alarms (conditional - only deployed if Docker image provided)
+  # ============================================================================
+
+  ServiceRestartAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDockerImage
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-service-restarts'
+      AlarmDescription: Alerts when ECS service experiences multiple task restarts (RunningTaskCount < DesiredCount more than once in 5 minutes)
+      MetricName: RunningTaskCount
+      Namespace: ECS/ContainerInsights
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EcsCluster
+        - Name: ServiceName
+          Value: !GetAtt EcsService.Name
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+
+  ZeroRunningTasksAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDockerImage
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-zero-running-tasks'
+      AlarmDescription: Alerts when no ECS tasks are running for 1 minute
+      MetricName: RunningTaskCount
+      Namespace: ECS/ContainerInsights
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EcsCluster
+        - Name: ServiceName
+          Value: !GetAtt EcsService.Name
+      TreatMissingData: breaching
+
+  ZeroHealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDockerImage
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-zero-healthy-targets'
+      AlarmDescription: Alerts when there are no healthy targets in the ALB target group
+      MetricName: HealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      TreatMissingData: breaching
+
+Outputs:
+  LoadBalancerUrl:
+    Description: URL of the Application Load Balancer
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  LoadBalancerDNS:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  ClusterName:
+    Description: ECS cluster name
+    Value: !Ref EcsCluster
+
+  ServiceName:
+    Condition: HasDockerImage
+    Description: ECS service name
+    Value: !GetAtt EcsService.Name
+
+  TaskDefinitionArn:
+    Condition: HasDockerImage
+    Description: Task definition ARN
+    Value: !Ref TaskDefinition
+
+  LogGroupName:
+    Description: CloudWatch log group for container output
+    Value: !Ref LogGroup
+
+  AlbSecurityGroupId:
+    Description: Security group ID for the ALB
+    Value: !Ref AlbSecurityGroup
+
+  EcsTaskSecurityGroupId:
+    Description: Security group ID for ECS tasks
+    Value: !Ref EcsTaskSecurityGroup
+
+  TargetGroupArn:
+    Description: Target group ARN
+    Value: !Ref TargetGroup
+
+  ServiceRestartAlarmName:
+    Condition: HasDockerImage
+    Description: CloudWatch alarm for service restarts
+    Value: !Ref ServiceRestartAlarm
+
+  ZeroRunningTasksAlarmName:
+    Condition: HasDockerImage
+    Description: CloudWatch alarm for zero running tasks
+    Value: !Ref ZeroRunningTasksAlarm
+
+  ZeroHealthyTargetsAlarmName:
+    Condition: HasDockerImage
+    Description: CloudWatch alarm for zero healthy ALB targets
+    Value: !Ref ZeroHealthyTargetsAlarm
