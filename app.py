@@ -24,19 +24,37 @@ def index():
         'endpoints': {
             '/healthy': 'Returns 200 OK - simulates healthy service',
             '/unhealthy': 'Returns 500 error - simulates unhealthy service',
-            '/slow-start': 'Takes 60s to respond - simulates slow startup',
             '/memory-leak': 'Allocates memory continuously - simulates memory leak',
-            '/status': 'Redirects to configured scenario URL (set via STATUS_ENDPOINT env var)'
+            '/status': 'Forwards internally to configured scenario URL (set via STATUS_ENDPOINT env var)'
+        },
+        'environment_variables': {
+            'STATUS_ENDPOINT': 'Set which endpoint /status forwards to (default: /healthy)',
+            'SLOW_START_DELAY': 'Delay in seconds before app becomes ready (simulates slow startup)',
+            'PORT': 'Port to run on (default: 8080)'
         }
     })
 
 @app.route('/status')
 def status():
-    """Status endpoint that redirects to configured scenario"""
-    from flask import redirect
+    """Status endpoint that internally forwards to configured scenario"""
     status_endpoint = os.getenv('STATUS_ENDPOINT', '/healthy')
-    logger.info(f"Status endpoint redirecting to: {status_endpoint}")
-    return redirect(status_endpoint)
+    logger.info(f"Status endpoint forwarding internally to: {status_endpoint}")
+
+    # Map endpoint paths to their handler functions
+    endpoint_handlers = {
+        '/healthy': healthy,
+        '/unhealthy': unhealthy,
+        '/memory-leak': memory_leak
+    }
+
+    # Get the handler function and call it directly
+    handler = endpoint_handlers.get(status_endpoint)
+    if handler:
+        return handler()
+    else:
+        # Default to healthy if unknown endpoint
+        logger.warning(f"Unknown status endpoint: {status_endpoint}, defaulting to healthy")
+        return healthy()
 
 @app.route('/healthy')
 def healthy():
@@ -55,18 +73,6 @@ def unhealthy():
         'status': 'unhealthy',
         'message': 'Service is experiencing issues'
     }), 500
-
-@app.route('/slow-start')
-def slow_start():
-    """Slow startup endpoint - takes 60s to respond"""
-    logger.info("Slow start endpoint called - will take 60 seconds")
-    time.sleep(60)
-    logger.info("Slow start endpoint responding after 60 seconds")
-    return jsonify({
-        'status': 'ready',
-        'message': 'Service ready after 60 seconds',
-        'delay_seconds': 60
-    }), 200
 
 @app.route('/memory-leak')
 def memory_leak():
@@ -91,5 +97,13 @@ def memory_leak():
 if __name__ == '__main__':
     important_value = os.environ['THIS_IS_IMPORTANT']
     port = int(os.getenv('PORT', 8080))
+
+    # Simulate slow startup if configured
+    slow_start_delay = int(os.getenv('SLOW_START_DELAY', 0))
+    if slow_start_delay > 0:
+        logger.info(f"SLOW_START_DELAY set to {slow_start_delay} seconds - simulating slow startup")
+        time.sleep(slow_start_delay)
+        logger.info(f"Startup delay complete - container is now ready")
+
     logger.info(f"Starting debug container on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)

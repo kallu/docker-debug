@@ -228,11 +228,16 @@ Resources:
                   - /unhealthy
                   - !If
                     - IsSlowStartScenario
-                    - /slow-start
+                    - /healthy
                     - !If
                       - IsMemoryLeakScenario
                       - /memory-leak
                       - /healthy
+            - Name: SLOW_START_DELAY
+              Value: !If
+                - IsSlowStartScenario
+                - '60'
+                - '0'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -266,7 +271,7 @@ Resources:
         - ContainerName: docker-debug
           ContainerPort: !Ref pContainerPort
           TargetGroupArn: !Ref TargetGroup
-      HealthCheckGracePeriodSeconds: 60
+      HealthCheckGracePeriodSeconds: 30
 
   # ============================================================================
   # CloudWatch Alarms (conditional - only deployed if Docker image provided)
