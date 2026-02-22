@@ -25,9 +25,18 @@ def index():
             '/healthy': 'Returns 200 OK - simulates healthy service',
             '/unhealthy': 'Returns 500 error - simulates unhealthy service',
             '/slow-start': 'Takes 60s to respond - simulates slow startup',
-            '/memory-leak': 'Allocates memory continuously - simulates memory leak'
+            '/memory-leak': 'Allocates memory continuously - simulates memory leak',
+            '/status': 'Redirects to configured scenario URL (set via STATUS_ENDPOINT env var)'
         }
     })
+
+@app.route('/status')
+def status():
+    """Status endpoint that redirects to configured scenario"""
+    from flask import redirect
+    status_endpoint = os.getenv('STATUS_ENDPOINT', '/healthy')
+    logger.info(f"Status endpoint redirecting to: {status_endpoint}")
+    return redirect(status_endpoint)
 
 @app.route('/healthy')
 def healthy():

@@ -7,6 +7,18 @@ A Docker container designed to simulate common failure scenarios in ECS/EKS envi
 ### `GET /`
 Returns a list of all available endpoints and their descriptions.
 
+### `GET /status`
+**Purpose**: Redirects to a configured error scenario endpoint
+**Response**: 302 redirect to the endpoint specified by `STATUS_ENDPOINT` environment variable
+**Use Case**: Health check endpoint that can be configured to simulate different scenarios
+**Default**: Redirects to `/healthy` if `STATUS_ENDPOINT` is not set
+
+```bash
+# Set the status endpoint via environment variable
+docker run -p 8080:8080 -e STATUS_ENDPOINT=/unhealthy -e THIS_IS_IMPORTANT=value docker-debug:latest
+curl http://localhost:8080/status  # Will redirect to /unhealthy
+```
+
 ### `GET /healthy`
 **Purpose**: Simulates a healthy service
 **Response**: 200 OK
@@ -105,6 +117,51 @@ docker run -p 8080:8080 -e THIS_IS_IMPORTANT=value docker-debug:latest
 Remove or comment out the `THIS_IS_IMPORTANT` environment variable from the task definition to simulate a misconfiguration scenario. The task will fail immediately with a `KeyError`.
 
 ## Deploying to ECS
+
+The CloudFormation template (`ecs-docker-debug.yaml`) includes a parameter `pErrorScenario` that automatically configures the container for different failure scenarios:
+
+### Available Error Scenarios
+
+1. **healthy** (default): `/status` → `/healthy`, `THIS_IS_IMPORTANT` is set
+   - Service runs normally and passes health checks
+
+2. **unhealthy**: `/status` → `/unhealthy`, `THIS_IS_IMPORTANT` is set
+   - Health checks fail with 500 errors, causing container restarts
+
+3. **slow-start**: `/status` → `/slow-start`, `THIS_IS_IMPORTANT` is set
+   - Health checks take 60 seconds to respond, testing startup probe settings
+
+4. **memory-leak**: `/status` → `/memory-leak`, `THIS_IS_IMPORTANT` is set
+   - Each health check allocates 100MB, eventually triggering OOMKilled
+
+5. **missing-env-var**: `/status` → `/healthy`, `THIS_IS_IMPORTANT` is NOT set
+   - Container fails to start due to missing required environment variable
+
+### Example Deployment with Error Scenario
+
+```bash
+# Deploy with unhealthy scenario
+aws cloudformation create-stack \
+  --stack-name docker-debug-unhealthy \
+  --template-body file://ecs-docker-debug.yaml \
+  --parameters \
+    ParameterKey=pDockerImage,ParameterValue=your-image:tag \
+    ParameterKey=pVpcId,ParameterValue=vpc-xxxxx \
+    ParameterKey=pPublicSubnetIds,ParameterValue="subnet-xxx,subnet-yyy" \
+    ParameterKey=pPrivateSubnetIds,ParameterValue="subnet-aaa,subnet-bbb" \
+    ParameterKey=pErrorScenario,ParameterValue=unhealthy
+
+# Deploy with missing environment variable scenario
+aws cloudformation create-stack \
+  --stack-name docker-debug-missing-env \
+  --template-body file://ecs-docker-debug.yaml \
+  --parameters \
+    ParameterKey=pDockerImage,ParameterValue=your-image:tag \
+    ParameterKey=pVpcId,ParameterValue=vpc-xxxxx \
+    ParameterKey=pPublicSubnetIds,ParameterValue="subnet-xxx,subnet-yyy" \
+    ParameterKey=pPrivateSubnetIds,ParameterValue="subnet-aaa,subnet-bbb" \
+    ParameterKey=pErrorScenario,ParameterValue=missing-env-var
+```
 
 ### ECS Service with Circuit Breaker (Prevents Infinite Restarts)
 
