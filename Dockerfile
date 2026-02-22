@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-alpine
 
 # Set working directory
 WORKDIR /app
@@ -7,9 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install curl for health checks and Python dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
-    rm -rf /var/lib/apt/lists/* && \
+RUN apk add --no-cache curl && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
