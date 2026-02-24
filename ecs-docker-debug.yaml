@@ -1,6 +1,35 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: ECS Fargate stack with ALB running a configurable Docker image for debugging. ALB in public subnets, containers in private subnets.
 
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - pVpcId
+          - pPublicSubnetIds
+          - pPrivateSubnetIds
+      - Label:
+          default: Application Configuration
+        Parameters:
+          - pDockerImage
+          - pContainerPort
+          - pErrorScenario
+    ParameterLabels:
+      pVpcId:
+        default: VPC ID
+      pPublicSubnetIds:
+        default: Public Subnet IDs
+      pPrivateSubnetIds:
+        default: Private Subnet IDs
+      pDockerImage:
+        default: Container Image
+      pContainerPort:
+        default: Container Port
+      pErrorScenario:
+        default: Error Scenario
+
 Parameters:
   pDockerImage:
     Type: String
@@ -113,6 +142,9 @@ Resources:
       UnhealthyThresholdCount: 3
       Matcher:
         HttpCode: 200-499
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '5'
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-tg'
@@ -210,6 +242,7 @@ Resources:
         - Name: docker-debug
           Image: !Ref pDockerImage
           Essential: true
+          StopTimeout: 5
           PortMappings:
             - ContainerPort: !Ref pContainerPort
               Protocol: tcp

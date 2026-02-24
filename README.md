@@ -143,6 +143,7 @@ The CloudFormation template (`ecs-docker-debug.yaml`) includes a parameter `pErr
 
 5. **missing-env-var**: `/status` → `/healthy`, `THIS_IS_IMPORTANT` is NOT set
    - Container fails to start due to missing required environment variable
+   - **⚠️ WARNING**: Stack updates with this scenario will NOT reach `UPDATE_COMPLETE` status as the ECS service cannot reach steady state. The container crashes immediately on startup, preventing the service from stabilizing. CloudFormation will remain stuck in `UPDATE_IN_PROGRESS` indefinitely. Use `aws cloudformation cancel-update-stack` to rollback if needed.
 
 ### Example Deployment with Error Scenario
 
